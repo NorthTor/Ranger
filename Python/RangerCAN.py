@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+
+import time
+import threading
+import can
+
+# -----------------------------
+# ACE Light / Ranger constants
+# -----------------------------
+NODE_ID = 0x01
+
+CAN_ID_COMMAND   = 0x600 + NODE_ID   # host -> Ranger
+CAN_ID_RESPONSE  = 0x580 + NODE_ID   # Ranger -> host
+CAN_ID_HEARTBEAT = 0x700 + NODE_ID   # Ranger -> host
+
+CMD_WRITE = 0x01
+CMD_READ  = 0x02
+
+PARAM_LED_PA1 = 0x01
+
+STATUS_EXECUTING       = 0x00
+STATUS_QUEUED          = 0x01
+STATUS_DATA_FOLLOWS    = 0x02
+STATUS_UNKNOWN_COMMAND = 0x10
+STATUS_INVALID_PARAM   = 0x11
+
+CHANNEL = "/dev/cu.usbmodem2080317458421"
+BITRATE = 1000000
+
+print_lock = threading.Lock()
+running = True
+
+
+def safe_print(*args, **kwargs):
+    with print_lock:
+        print(*args, **kwargs)
+
+
+def status_to_string(status: int) -> str:
+    lookup = {
+        STATUS_EXECUTING: "Accepted, executing",
+        STATUS_QUEUED: "Accepted, queued",
+        STATUS_DATA_FOLLOWS: "Accepted, data follows",
+        STATUS_UNKNOWN_COMMAND: "Unknown command",
+        STATUS_INVALID_PARAM: "Invalid parameter",
+    }
+    return lookup.get(status, f"Unknown status 0x{status:02X}")
+
+
+def build_write_led(state: int) -> can.Message:
+    data = [
+        CMD_WRITE,
+        PARAM_LED_PA1,
+        0x01 if state else 0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+    ]
+    return can.Message(
+        arbitration_id=CAN_ID_COMMAND,
+        is_extended_id=False,
+        data=data
+    )
+
+
+def build_read_led() -> can.Message:
+    data = [
+        CMD_READ,
+        PARAM_LED_PA1,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+    ]
+    return can.Message(
+        arbitration_id=CAN_ID_COMMAND,
+        is_extended_id=False,
+        data=data
+    )
+
+
+def print_message(prefix: str, msg: can.Message) -> None:
+    hex_data = " ".join(f"{b:02X}" for b in msg.data)
+    safe_print(f"{prefix} ID=0x{msg.arbitration_id:03X} DLC={msg.dlc} DATA=[{hex_data}]")
+
+
+def decode_response(msg: can.Message) -> None:
+    if len(msg.data) < 8:
+        safe_print("Response too short")
+        return
+
+    command_id   = msg.data[0]
+    status_code  = msg.data[1]
+    parameter_id = msg.data[2]
+    payload      = msg.data[3:8]
+
+    print_message("Response", msg)
+    safe_print(f"  command_id   = 0x{command_id:02X}")
+    safe_print(f"  status_code  = 0x{status_code:02X} ({status_to_string(status_code)})")
+    safe_print(f"  parameter_id = 0x{parameter_id:02X}")
+    safe_print(f"  payload      = {[f'0x{x:02X}' for x in payload]}")
+
+    if command_id == CMD_READ and status_code == STATUS_DATA_FOLLOWS and parameter_id == PARAM_LED_PA1:
+        led_state = payload[0]
+        safe_print(f"  decoded LED state = {'OFF' if led_state else 'ON'}")
+
+
+def listener_thread(bus: can.Bus) -> None:
+    global running
+
+    safe_print("Background listener started...")
+    while running:
+        try:
+            msg = bus.recv(timeout=1.0)
+            if msg is None:
+                continue
+
+            if msg.arbitration_id == CAN_ID_HEARTBEAT:
+                print_message("Heartbeat", msg)
+            elif msg.arbitration_id == CAN_ID_RESPONSE:
+                decode_response(msg)
+            else:
+                print_message("Other", msg)
+
+        except Exception as exc:
+            safe_print(f"Listener error: {exc}")
+            break
+
+    safe_print("Background listener stopped.")
+
+
+def send_command(bus: can.Bus, msg: can.Message, label: str) -> None:
+    try:
+        safe_print(f"\n---- {label} ----")
+        print_message("TX", msg)
+        bus.send(msg)
+    except Exception as exc:
+        safe_print(f"Send error: {exc}")
+
+
+def print_menu() -> None:
+    safe_print("\nCommands:")
+    safe_print("  1  -> WRITE LED ON")
+    safe_print("  2  -> WRITE LED OFF")
+    safe_print("  3  -> READ LED STATE")
+    safe_print("  4  -> WRITE LED ON, then READ")
+    safe_print("  5  -> WRITE LED OFF, then READ")
+    safe_print("  m  -> show menu")
+    safe_print("  q  -> quit\n")
+
+
+def main() -> None:
+    global running
+
+    safe_print("Opening CAN bus...")
+    with can.Bus(interface="slcan", channel=CHANNEL, bitrate=BITRATE) as bus:
+        safe_print("Connected.")
+
+        t = threading.Thread(target=listener_thread, args=(bus,), daemon=True)
+        t.start()
+
+        print_menu()
+
+        try:
+            while True:
+                cmd = input("> ").strip().lower()
+
+                if cmd == "1":
+                    send_command(bus, build_write_led(0), "WRITE LED ON")
+
+                elif cmd == "2":
+                    send_command(bus, build_write_led(1), "WRITE LED OFF")
+
+                elif cmd == "3":
+                    send_command(bus, build_read_led(), "READ LED STATE")
+
+                elif cmd == "4":
+                    send_command(bus, build_write_led(0), "WRITE LED ON")
+                    time.sleep(0.1)
+                    send_command(bus, build_read_led(), "READ LED STATE")
+
+                elif cmd == "5":
+                    send_command(bus, build_write_led(1), "WRITE LED OFF")
+                    time.sleep(0.1)
+                    send_command(bus, build_read_led(), "READ LED STATE")
+
+                elif cmd == "m":
+                    print_menu()
+
+                elif cmd == "q":
+                    safe_print("Quitting...")
+                    break
+
+                elif cmd == "":
+                    continue
+
+                else:
+                    safe_print("Unknown command. Press 'm' for menu.")
+
+        except KeyboardInterrupt:
+            safe_print("\nKeyboard interrupt received. Exiting...")
+
+        running = False
+        time.sleep(0.2)
+
+
+if __name__ == "__main__":
+    main()
