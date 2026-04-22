@@ -1,2 +1,2 @@
 # Ranger
-Public FW / SW for the Ranger module
+Public FW / SW for the AceHigh Ranger module
